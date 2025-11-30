@@ -1,0 +1,554 @@
+%% ============================================================
+%  FORECAST + MULTI-MODEL APPLIANCES + MILP VS RANDOM
+%  ============================================================
+clear; clc; close all;
+rng(2);                % reproducible randomness
+
+load('forecasting_pred.mat');  % gives L_fore_naive, L_fore_smart, L_true, t
+% t is in hours, length T
+
+% L_true = zeros(1,length(L_true));
+% L_fore_smart = zeros(1,length(L_fore_smart));
+clear L_fore_naive
+
+T     = numel(t);
+t_grid = t * 3600;     % seconds
+dt     = diff(t_grid);
+N      = numel(t_grid);
+Nint   = N-1;
+
+%% ============================================================
+%  DATA-DRIVEN FORECAST ERROR BOUND epsilon_k
+% =============================================================
+% For a single-day demo we use the absolute error of the current day
+% as a proxy for "historical" errors. In practice, you would aggregate
+% errors over many past days and compute statistics there.
+
+abs_err = abs(L_true(1:Nint) - L_fore_smart(1:Nint));  % kW
+
+% Robustness level: e.g., 95th percentile of absolute error
+alpha_robust = 95;  % [%]
+if exist('prctile','file')
+    eps_const = prctile(abs_err, alpha_robust);
+else
+    % fallback if Statistics Toolbox is not available
+    sorted_err = sort(abs_err);
+    idx = max(1, round(alpha_robust/100 * numel(sorted_err)));
+    eps_const = sorted_err(idx);
+end
+
+% You can choose either a constant bound or time-varying bound.
+% Here we use a constant robust bound derived from statistics:
+epsilon_k = eps_const * ones(Nint,1);
+
+fprintf('Estimated robust error bound eps_const = %.3f kW (%.0f-th percentile)\n',...
+        eps_const, alpha_robust);
+
+%% ============================================================
+%  CREATE APPLIANCES (REASONABLE POWER LEVELS)
+% =============================================================
+Appliances = {};
+
+% peak forecast is roughly ~3 kW → individual appliances ~0.3–1.2 kW
+N_square      = 2;
+N_ramp        = 2;
+N_piecewise   = 2;
+N_first_order = 2;
+
+% Square loads (e.g., small heaters)
+for n = 1:N_square
+    params.power    = 0.8;       % kW
+    params.duration = 1.0*3600;  % 1 h
+    Appliances{end+1} = createAppliance("square", params);
+end
+
+% Ramp-type loads (small HVAC)
+for n = 1:N_ramp
+    params.A_min     = 0.2;
+    params.A_nom     = 1.0;
+    params.ramp_up   = 0.2*3600;
+    params.ramp_down = 0.2*3600;
+    params.duration  = 1.5*3600;
+    Appliances{end+1} = createAppliance("ramp", params);
+end
+
+% Piecewise-cycle loads (dishwasher / washing machine)
+for n = 1:N_piecewise
+    params.stages     = [0.3, 0.9, 1.2];
+    params.stage_durs = [0.3, 0.7, 0.4]*3600;
+    Appliances{end+1} = createAppliance("piecewise", params);
+end
+
+% First-order dynamic loads (e.g., freezer/compressor)
+for n = 1:N_first_order
+    params.Ci       = 1.0;
+    params.alpha    = 1/600;     % ~10 min time constant
+    params.u_nom    = 0.8;       % kW
+    params.duration = 2*3600;    % 2 h
+    Appliances{end+1} = createAppliance("first_order", params);
+end
+
+M = numel(Appliances);
+fprintf("Created %d appliances.\n", M);
+
+%% ============================================================
+%  TIME WINDOWS (NO NIGHT STARTS FOR NOISY DEVICES)
+% =============================================================
+% Define admissible start indices W_i for each appliance.
+% Example: all appliances may start only between 07:00 and 22:00.
+AllowedWindows = cell(M,1);
+for i = 1:M
+    allowed_mask = (t(1:Nint) >= 7) & (t(1:Nint) <= 22);
+    AllowedWindows{i} = allowed_mask;
+end
+
+%% ============================================================
+%  PRECEDENCE / SUCCESSION CONSTRAINTS
+% =============================================================
+
+Succession = {};
+% Example: appliance 3 (e.g., dryer) must start 1h–1.5h after appliance 1 
+Succession{1} = struct("i",1,"j",3, ...
+                       "gmin",1.0*3600, "gmax",1.5*3600);
+
+%% ============================================================
+%  SAMPLE PROFILES p_{i,τ,k} FOR MILP
+% =============================================================
+fprintf("Sampling appliance profiles onto non-uniform grid...\n");
+
+p = cell(M,1);   % each p{i} is N x N (tau,k)
+
+for i = 1:M
+    Ai = Appliances{i};
+
+    dt_internal = 60;                   % 1-min internal resolution
+    tau_int = 0:dt_internal:Ai.duration;
+
+    % --- intrinsic profile p_i(τ) ---
+    switch Ai.type
+        case "square"
+            p_int = Ai.power * ones(size(tau_int));
+
+        case "ramp"
+            p_int = zeros(size(tau_int));
+            for kk = 1:numel(tau_int)
+                tau = tau_int(kk);
+                if tau < Ai.ramp_up
+                    p_int(kk) = Ai.A_min + (Ai.A_nom-Ai.A_min)*(tau/Ai.ramp_up);
+                elseif tau < (Ai.duration - Ai.ramp_down)
+                    p_int(kk) = Ai.A_nom;
+                else
+                    rem = tau - (Ai.duration-Ai.ramp_down);
+                    p_int(kk) = Ai.A_nom - (Ai.A_nom-Ai.A_min)*(rem/Ai.ramp_down);
+                end
+            end
+
+        case "piecewise"
+            p_int = zeros(size(tau_int));
+            edges = [0, cumsum(Ai.stage_durs)];
+            for s = 1:numel(Ai.stages)
+                idx = (tau_int >= edges(s) & tau_int < edges(s+1));
+                p_int(idx) = Ai.stages(s);
+            end
+
+        case "first_order"
+            Pprof = zeros(size(tau_int));
+            for kk = 2:numel(tau_int)
+                dtt = tau_int(kk) - tau_int(kk-1);
+                Pprof(kk) = exp(-Ai.alpha*dtt)*Pprof(kk-1) + ...
+                            (1-exp(-Ai.alpha*dtt))*Ai.u_nom;
+            end
+            p_int = Pprof;
+
+        otherwise
+            error("Type %s not yet supported in profile sampling.", Ai.type);
+    end
+
+    % --- project onto non-uniform external grid (τ,k) ---
+    p_mat = zeros(N,N);
+    for tau_idx = 1:Nint
+        elapsed = 0;
+        for k_idx = tau_idx:Nint
+            elapsed = elapsed + dt(k_idx);
+            if elapsed > tau_int(end)
+                val = 0;
+            else
+                val = interp1(tau_int, p_int, elapsed, 'linear', 0);
+            end
+            p_mat(tau_idx,k_idx) = val;
+        end
+    end
+
+    p{i} = p_mat;
+end
+
+% quick sanity check
+for i = 1:M
+    fprintf("Appliance %d: max profile = %.2f kW\n", i, max(p{i}(:)));
+end
+
+%% ============================================================
+%  ENERGY PRICE PROFILE
+% =============================================================
+% Simple TOU pattern: low at night, high in morning/evening
+price = 0.2 * ones(Nint,1); % €/kWh
+peak_idx = ((t(1:Nint) >= 7) & (t(1:Nint) <= 10)) | ...
+           ((t(1:Nint) >= 18) & (t(1:Nint) <= 21));
+price(peak_idx) = 0.5;       % higher price
+
+dt_h = dt/3600;              % interval length in hours
+
+gamma_peak = 1.0;            % weight for peak term
+lambda_pref = 0.1;           % weight for user preference penalties
+
+%% ============================================================
+%  PLOT ENERGY PRICE PROFILE
+% =============================================================
+figure; grid on; hold on;
+plot(t(1:Nint), price, 'LineWidth', 1.8);
+xlabel('Time [h]');
+ylabel('Price [€/kWh]');
+title('Time-of-Use Energy Price Profile');
+
+
+%% ============================================================
+%  MILP FORMULATION  (minimize energy cost + peak)
+% =============================================================
+
+num_y = M * Nint;
+idxP  = num_y + 1;
+
+% --- Objective coefficients f (linear in y and P) ---
+f = zeros(num_y+1,1);
+
+% cost contribution for each y_{i,tau}:
+%   sum_k price(k) * p_{i,tau,k} * dt_h(k)
+offset = 0;
+for i = 1:M
+    pm = p{i};               % N x N
+    for tau = 1:Nint
+        coeff = sum(price(:) .* pm(tau,1:Nint)' .* dt_h(:));
+        f(offset + tau) = coeff;
+    end
+    offset = offset + Nint;
+end
+
+% user preference penalties: penalize starts in "undesirable" times (e.g., night)
+offset = 0;
+for i = 1:M
+    for k = 1:Nint
+        if ~AllowedWindows{i}(k)
+            f(offset + k) = f(offset + k) + lambda_pref; %#ok<AGROW>
+        end
+    end
+    offset = offset + Nint;
+end
+
+% peak penalty (gamma * P)
+f(idxP) = gamma_peak;
+
+A   = [];  b   = [];
+Aeq = [];  beq = [];
+
+% --- Single-start constraints with time windows ---
+for i = 1:M
+    row = zeros(1,num_y+1);
+    base = (i-1)*Nint;
+    % sum over allowed k only
+    idx_allowed = find(AllowedWindows{i});
+    row(base + idx_allowed) = 1;
+    Aeq = [Aeq; row];
+    beq = [beq; 1];
+end
+
+% --- Time-window constraints y_{i,k} = 0 if not allowed ---
+for i = 1:M
+    base = (i-1)*Nint;
+    idx_not = find(~AllowedWindows{i});
+    for kk = idx_not(:)'
+        row = zeros(1,num_y+1);
+        row(base + kk) = 1;
+        A   = [A; row];
+        b   = [b; 0];
+    end
+end
+
+% --- Succession constraints (bounded delay) ---
+for s = 1:numel(Succession)
+    sc = Succession{s};
+    i = sc.i;  j = sc.j;
+
+    base_i = (i-1)*Nint;
+    base_j = (j-1)*Nint;
+
+    S_i = zeros(1,num_y+1);
+    S_j = zeros(1,num_y+1);
+
+    S_i(base_i + (1:Nint)) = t_grid(1:Nint);
+    S_j(base_j + (1:Nint)) = t_grid(1:Nint);
+
+    % gmin  ≤ S_j - S_i
+    A = [A; -(S_j - S_i)];
+    b = [b; -sc.gmin];
+
+    % S_j - S_i ≤ gmax
+    A = [A;  (S_j - S_i)];
+    b = [b;  sc.gmax];
+end
+
+% % --- Peak constraints with uncertainty margin epsilon ---
+% epsilon = 0.1;        % kW margin
+% for k = 1:Nint
+%     row = zeros(1,num_y+1);
+% 
+%     offset = 0;
+%     for i = 1:M
+%         pm = p{i};
+%         for tau = 1:Nint
+%             row(offset + tau) = pm(tau,k);
+%         end
+%         offset = offset + Nint;
+%     end
+% 
+%     % L_fore_smart(k) + epsilon + sum_i p_{i,tau,k} y_{i,tau} <= P
+%     %  → sum_i p y - P <= -L_fore_smart(k) - epsilon
+%     row(idxP) = -1;
+%     rhs = -L_fore_smart(k) - epsilon;
+% 
+%     A = [A; row];
+%     b = [b; rhs];
+% end
+% --- Peak constraints with data-driven epsilon_k ---
+for k = 1:Nint
+    row = zeros(1,num_y+1);
+
+    offset = 0;
+    for i = 1:M
+        pm = p{i};
+        for tau = 1:Nint
+            row(offset + tau) = pm(tau,k);
+        end
+        offset = offset + Nint;
+    end
+
+    % Robust constraint:
+    %   L_fore_smart(k) + epsilon_k(k) + sum_i p_{i,tau,k} y_{i,tau} <= P
+    %   → sum_i p y - P <= -L_fore_smart(k) - epsilon_k(k)
+    row(idxP) = -1;
+    rhs = -L_fore_smart(k) - epsilon_k(k);
+
+    A = [A; row];
+    b = [b; rhs];
+end
+
+
+% --- Maximum simultaneous activations (optional) ---
+Nmax = 3;  % max number of appliances ON at same time
+for k = 1:Nint
+    row = zeros(1,num_y+1);
+    offset = 0;
+    for i = 1:M
+        pm = p{i};
+        for tau = 1:Nint
+            if pm(tau,k) > 1e-4    % treat as "ON" if load > small threshold
+                row(offset + tau) = row(offset + tau) + 1;
+            end
+        end
+        offset = offset + Nint;
+    end
+    % sum_i x_{i,k} <= Nmax  encoded directly in y
+    A = [A; row];
+    b = [b; Nmax];
+end
+
+% --- Contractual power limit P <= P_max ---
+P_max = 6.0;   % kW
+rowP = zeros(1,num_y+1);
+rowP(idxP) = 1;
+A = [A; rowP];
+b = [b; P_max];
+
+% --- Solve MILP ---
+lb = zeros(num_y+1,1);
+ub = ones(num_y+1,1);
+ub(idxP) = P_max;    % also enforce as upper bound
+
+intcon = 1:num_y;
+opts = optimoptions('intlinprog', ...
+                    'Display','iter', ...
+                    'MaxTime',20);
+
+fprintf("Solving MILP...\n");
+[sol, fval, exitflag] = intlinprog(f,intcon,A,b,Aeq,beq,lb,ub,opts);
+if exitflag <= 0
+    warning('intlinprog did not converge: exitflag = %d', exitflag);
+end
+y_milp = sol(1:num_y);
+P_milp = sol(idxP);
+
+%% ============================================================
+%  RANDOM FEASIBLE SCHEDULE + PRECEDENCE ADJUSTMENT
+% =============================================================
+
+y_rand = randomSchedule(Appliances, t_grid);   % duration-feasible only
+
+% Enforce the same time-window constraint for random schedule
+for i = 1:M
+    base = (i-1)*Nint;
+    mask_not = ~AllowedWindows{i};
+    y_rand(base + find(mask_not)) = 0;
+    % if we killed the only start, reassign randomly inside window
+    if sum(y_rand(base + (1:Nint))) == 0
+        allowed = find(AllowedWindows{i});
+        if isempty(allowed)
+            error('No allowed start times for appliance %d in random schedule.',i);
+        end
+        k_new = allowed(randi(numel(allowed)));
+        y_rand(base + k_new) = 1;
+    end
+end
+
+% adjust for succession constraints (simple repair heuristic)
+for s = 1:numel(Succession)
+    sc = Succession{s};
+    i = sc.i;  j = sc.j;
+    base_i = (i-1)*Nint;
+    base_j = (j-1)*Nint;
+
+    ki = find(y_rand(base_i + (1:Nint))==1, 1);
+    kj = find(y_rand(base_j + (1:Nint))==1, 1);
+
+    Si = t_grid(ki);
+    Sj = t_grid(kj);
+
+    if Sj - Si < sc.gmin
+        target = Si + sc.gmin;
+        [~, new_kj] = min(abs(t_grid - target));
+        new_kj = min(new_kj, Nint);
+        y_rand(base_j + (1:Nint)) = 0;
+        y_rand(base_j + new_kj) = 1;
+    elseif Sj - Si > sc.gmax
+        target = Si + sc.gmax;
+        [~, new_kj] = min(abs(t_grid - target));
+        new_kj = max(1,new_kj);
+        y_rand(base_j + (1:Nint)) = 0;
+        y_rand(base_j + new_kj) = 1;
+    end
+end
+
+%% ============================================================
+%  COMPUTE LOADS FOR MILP AND RANDOM
+% =============================================================
+
+load_milp_add = zeros(N,1);
+load_rand_add = zeros(N,1);
+
+offset = 0;
+for i = 1:M
+    pm = p{i};
+    y_i_milp = y_milp(offset + (1:Nint));
+    y_i_rand = y_rand(offset + (1:Nint));
+
+    load_milp_add = load_milp_add + computeApplianceLoad(pm, y_i_milp);
+    load_rand_add = load_rand_add + computeApplianceLoad(pm, y_i_rand);
+
+    offset = offset + Nint;
+end
+
+L_total_milp_true = L_true(:) + load_milp_add;
+L_total_rand_true = L_true(:) + load_rand_add;
+
+P_true_base  = max(L_true);
+P_milp_true  = max(L_total_milp_true);
+P_rand_true  = max(L_total_rand_true);
+
+fprintf('\n=== Peaks under true load ===\n');
+fprintf('True load only               : %.3f kW\n', P_true_base);
+fprintf('MILP schedule (true)         : %.3f kW\n', P_milp_true);
+fprintf('Random schedule (true)       : %.3f kW\n', P_rand_true);
+
+%% ============================================================
+%  COST EVALUATION (FORECAST vs TRUE)
+% ============================================================
+
+% Under forecast: baseline forecast + scheduled appliances
+L_total_milp_fore = L_fore_smart(:) + load_milp_add;
+L_total_rand_fore = L_fore_smart(:) + load_rand_add;
+L_base_fore       = L_fore_smart(:);
+
+% Under true load: true baseline + scheduled appliances
+L_total_milp_true = L_true(:) + load_milp_add;
+L_total_rand_true = L_true(:) + load_rand_add;
+L_base_true       = L_true(:);
+
+% Peaks (already partially computed)
+P_fore_base = max(L_base_fore(1:Nint));
+P_milp_fore = max(L_total_milp_fore(1:Nint));
+P_rand_fore = max(L_total_rand_fore(1:Nint));
+
+P_true_base = max(L_base_true(1:Nint));
+P_milp_true = max(L_total_milp_true(1:Nint));
+P_rand_true = max(L_total_rand_true(1:Nint));
+
+fprintf('\n=== Peaks under forecast ===\n');
+fprintf('Baseline forecast            : %.3f kW\n', P_fore_base);
+fprintf('MILP schedule (forecast)     : %.3f kW\n', P_milp_fore);
+fprintf('Random schedule (forecast)   : %.3f kW\n', P_rand_fore);
+
+fprintf('\n=== Peaks under true load ===\n');
+fprintf('True load only               : %.3f kW\n', P_true_base);
+fprintf('MILP schedule (true)         : %.3f kW\n', P_milp_true);
+fprintf('Random schedule (true)       : %.3f kW\n', P_rand_true);
+
+% -------- Energy cost (using the same price profile) --------
+% cost ≈ sum_k L(k) * price(k) * Δt_k  (kWh * €/kWh = €)
+
+Cost_fore_base = sum(L_base_fore(1:Nint)       .* price(:) .* dt_h(:));
+Cost_fore_milp = sum(L_total_milp_fore(1:Nint) .* price(:) .* dt_h(:));
+Cost_fore_rand = sum(L_total_rand_fore(1:Nint) .* price(:) .* dt_h(:));
+
+Cost_true_base = sum(L_base_true(1:Nint)       .* price(:) .* dt_h(:));
+Cost_true_milp = sum(L_total_milp_true(1:Nint) .* price(:) .* dt_h(:));
+Cost_true_rand = sum(L_total_rand_true(1:Nint) .* price(:) .* dt_h(:));
+
+fprintf('\n=== Energy costs under forecast prices (€/day) ===\n');
+fprintf('Baseline only                : %.3f €\n', Cost_fore_base);
+fprintf('MILP schedule                : %.3f €\n', Cost_fore_milp);
+fprintf('Random schedule              : %.3f €\n', Cost_fore_rand);
+
+fprintf('\n=== Energy costs under true load (same prices) ===\n');
+fprintf('Baseline only                : %.3f €\n', Cost_true_base);
+fprintf('MILP schedule                : %.3f €\n', Cost_true_milp);
+fprintf('Random schedule              : %.3f €\n', Cost_true_rand);
+
+%% ============================================================
+%  PLOTS
+% =============================================================
+
+figure; hold on; grid on;
+plot(t, L_true,           'k',  'LineWidth',2);
+plot(t, L_fore_smart,     '--k','LineWidth',1.2);
+plot(t, L_total_milp_true,'r',  'LineWidth',2);
+plot(t, L_total_rand_true,'b',  'LineWidth',1.6);
+xlabel('Time [h]');
+ylabel('Load [kW]');
+legend('True Load', 'Smart Forecast', ...
+       sprintf('MILP schedule (peak=%.2f)',P_milp_true), ...
+       sprintf('Random schedule (peak=%.2f)',P_rand_true), ...
+       'Location','NorthWest');
+title('Optimal Appliance Scheduling vs Random Feasible Scheduling');
+
+%% ============================================================
+%  HELPER
+% ============================================================
+function L = computeApplianceLoad(p_i, y_i)
+% p_i : N x N matrix (tau,k)
+% y_i : length N-1 binary vector of start decisions
+
+N = size(p_i,1);
+L = zeros(N,1);
+starts = find(y_i > 0.5);
+for s = starts'
+    L = L + p_i(s,:)';
+end
+end
