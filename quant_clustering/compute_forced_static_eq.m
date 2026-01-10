@@ -1,0 +1,28 @@
+function eqStruct = compute_forced_static_eq(A,B,C,Kx,Kz,r_eq)
+
+n = size(A,1);
+
+z_eq = (C/(eye(n)-A-B*Kx)*B*Kz)\r_eq;
+% x_eq = C\r_eq;
+x_eq = (eye(n)-A-B*Kx)\B*Kz*z_eq;
+% y_eq = C*x_eq;
+y_eq = r_eq;
+assert(norm(C*x_eq-r_eq) < 1e-10)
+% z_eq = (B*Kz)\(eye(n)-A-B*Kx)*x_eq;
+u_eq = Kx*x_eq+Kz*z_eq;
+
+xi_eq = [x_eq;z_eq];
+
+% xi_eq = [info_ideal.XK(:,end);info_ideal.ZK(:,end)];
+% u_eq = info_ideal.UK(:,end);
+% y_eq = info_ideal.YK(:,end);
+%
+eqStruct = struct(...
+    'x_eq',x_eq,...
+    'z_eq',z_eq,...
+    'xi_eq',xi_eq,...
+    'u_eq',u_eq,...
+    'y_eq',y_eq...
+);
+
+end

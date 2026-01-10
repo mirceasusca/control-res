@@ -6,11 +6,6 @@ Ts = 0.1;
 % A, B controllable
 A = [1.2,0.4;
     -0.3,0.9];
-% A = [1.2,0.4;
-%     -0.3,1.2];
-% A = [1.2,0.2;
-%     -0.3,0.9];
-% A = diag([0.92, 0.95]);
 B = [1;0.5];
 C = [1,1];
 D = 0;
@@ -25,7 +20,7 @@ zero(sys)
 % figure,step(sys,10)
 
 %% LQI design
-Q = diag([10,2,20]);
+Q = diag([10,2,20])/10;
 R = 0.5;
 N = zeros(n+p,m);
 [Klqi,S,e] = lqi(sys,Q,R,N);
@@ -46,7 +41,7 @@ syscl = ss(Acl,Bcl_ref,Ccl,Dcl,Ts);
 figure,step(syscl)
 
 %%
-tfin = 100;
+tfin = 60;
 % ref = @(t) 0.2;
 r_eq = 0.2;
 ref_sig = @(t) r_eq;
@@ -65,8 +60,7 @@ qStructIdeal = struct(...
 
 %% Monte Carlo dataset creation for Kmeans clustering
 % Nexp = 1000;
-% Nexp = 200;
-Nexp = 300;
+Nexp = 200;
 
 % domeniul de variatie al conditiilor initiale
 x0min = [-2,-2];
@@ -105,7 +99,7 @@ qUnif_x2 = diff(range_x2)/2^n_bits;
 qUnif_y1 = diff(range_y1)/2^n_bits;
 qUnif_u1 = diff(range_u1)/2^n_bits;
 
-opts = statset('MaxIter', 1000, 'Display', 'final');
+opts = statset('MaxIter', 500, 'Display', 'final');
 
 %%
 [~, CX1] = kmeans(Xdataset(:,1), num_clusters_KX1, 'Replicates', 7, 'Options', opts);
@@ -168,7 +162,7 @@ stem([range_u1(1):qUnif_u1:range_u1(2)],ones(size([range_u1(1):qUnif_u1:range_u1
 % establish new setup and deduce equilibrium
 ref_sig_new = ref_sig;
 % x_tilde_0 = [-0.5;0.75;0]; % trei stari initiale, (x1,x2,z1=0), z0=0 la integratoare, de obicei
-tfin = 200000;
+x_tilde_0 = [+0.5;0.5;0]; 
 % tfin = 2e5;
 % tfin = 5e5;
 % tfin = 1e6;
@@ -192,7 +186,6 @@ for k = 1:Nsim
     z10 = z0min(1)+(z0max(1)-z0min(1))*rand(1);
     % x_tilde_0 = [x10;x20;0];
     x_tilde_0 = [x10;x20;z10];
-    x_tilde_0
     
     info_ideal = sim_lqi(sys,lqrStruct,x_tilde_0,tfin,ref_sig,qStructIdeal,eqStruct);
     
@@ -236,49 +229,37 @@ for k = 1:Nsim
 
 end
 
+%%
 out = (J_exp_mat(:,3)-J_exp_mat(:,1))./(J_exp_mat(:,2)-J_exp_mat(:,1));
 
 stem(out)
-tfin
-exp_mean = mean(out)
-exp_std = std(out)
 
-figure
-t = (0:size(info_ideal.XK,2)-1)*Ts;
-subplot(221)
-plot(t,info_ideal.XK,t,info_kmeans.XK,t,info_uniform.XK)
-legend('ideal','kmeans','uniform')
-ylabel('X')
-subplot(222)
-plot(t,info_ideal.YK,t,info_kmeans.YK,t,info_uniform.YK)
-legend('ideal','kmeans','uniform')
-yline(ref_sig(0)) % linie suplimentara la referinta, dupa colorare
-ylabel('R/Y')
-subplot(223)
-plot(t,info_ideal.UK,t,info_kmeans.UK,t,info_uniform.UK)
-legend('ideal','kmeans','uniform')
-ylabel('U')
-subplot(224)
-plot(t,info_ideal.ZK,t,info_kmeans.ZK,t,info_uniform.ZK)
-legend('ideal','kmeans','uniform')
-ylabel('Z')
-shg
+%
+% figure
+% t = (0:size(info_ideal.XK,2)-1)*Ts;
+% subplot(221)
+% plot(t,info_ideal.XK,t,info_kmeans.XK,t,info_uniform.XK)
+% legend('ideal','kmeans','uniform')
+% ylabel('X')
+% subplot(222)
+% plot(t,info_ideal.YK,t,info_kmeans.YK,t,info_uniform.YK)
+% legend('ideal','kmeans','uniform')
+% yline(ref_sig(0)) % linie suplimentara la referinta, dupa colorare
+% ylabel('R/Y')
+% subplot(223)
+% plot(t,info_ideal.UK,t,info_kmeans.UK,t,info_uniform.UK)
+% legend('ideal','kmeans','uniform')
+% ylabel('U')
+% subplot(224)
+% plot(t,info_ideal.ZK,t,info_kmeans.ZK,t,info_uniform.ZK)
+% legend('ideal','kmeans','uniform')
+% ylabel('Z')
+% shg
 
 %
 % ideal ce am vrea: J_ideal < J_kmeans < J_altceva
 % ar trebui ca nimic sa nu depaseasca J_ideal; daca se intampla, inseamna
 % ca ceva nu e corect construit ca principiu (problema de referinta).
-
-%%
-tv = [1000,10000,50000,100000]
-em = [64.351578216805052,73.325239391318206,73.807008459309472,74.186202123893196]
-es = [7.458645304806820,0.956238277464490,0.509799589156646,0.183199449854433]
-
-figure
-subplot(211)
-loglog(tv,em,'-o')
-subplot(212)
-loglog(tv,es,'-o')
 
 %% Conclusions, remarks
 % - seems that J is not directly correlated to the performance of the
